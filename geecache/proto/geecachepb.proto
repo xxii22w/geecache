@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package geecachepb;
+
+option go_package = "./proto";
+
+// 用于想缓存服务发起请求
+// group 缓存组的名称
+// key 获取的缓存键
+message Request {
+    string group = 1;  
+    string key = 2;
+}
+
+message Response {
+    bytes value = 1;
+}
+
+service GroupCache{
+    rpc Get(Request) returns (Response);
+  }
