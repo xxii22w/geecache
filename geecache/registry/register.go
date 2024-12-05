@@ -19,42 +19,49 @@ var (
 
 // etcdAdd 在租赁模式添加一对kv至etcd
 // 四个参数分别是etcd客户端，etcd租约ID，服务名称，服务地址
-func etcdAdd(c *clientv3.Client, lid clientv3.LeaseID, service string, addr string) error {
+func etcdAdd(c *clientv3.Client, lid *clientv3.LeaseID, service string, addr string) error {
 	em, err := endpoints.NewManager(c, service) //创建一个用于管理 etcd 中的服务端点（endpoints）
 	if err != nil {
 		return err
 	}
 	//该方法用于将指定的服务地址（addr）添加到 etcd 中的服务端点列表中。
 	//clientv3.WithLease(lid) 选项表示使用指定的租约 ID（lid）来设置键值的生命周期。
-	return em.AddEndpoint(c.Ctx(), service+"/"+addr, endpoints.Endpoint{Addr: addr}, clientv3.WithLease(lid))
+	return em.AddEndpoint(c.Ctx(), service+"/"+addr, endpoints.Endpoint{Addr: addr}, clientv3.WithLease(*lid))
 }
 
 // Register 注册一个服务至etcd,并且在服务的生命周期内保持心跳检测，确保服务的持续在线。
-func Register(service string, addr string, stop chan error) error {
-	// 创建一个etcd client
+// 注意 Register将不会return 如果没有error的话
+func Register(service, addr string, stop chan error) error {
+	// 创建一个etcd客户端
 	cli, err := clientv3.New(defaultEtcdConfig)
 	if err != nil {
 		return fmt.Errorf("create etcd client failed: %v", err)
 	}
 	defer cli.Close()
-	// 创建一个租约 配置5秒过期
-	resp, err := cli.Grant(context.Background(), 5)
+	// 创建一个租约，设置租约的过期时间为5秒
+	var ttl int64 = 5
+	resp, err := cli.Grant(cli.Ctx(), ttl)
 	if err != nil {
 		return fmt.Errorf("create lease failed: %v", err)
 	}
-	leaseId := resp.ID //获取了该租约的 ID
+	leaseID := resp.ID // 获取租约ID
 	// 注册服务
-	err = etcdAdd(cli, leaseId, service, addr)
-	if err != nil {
-		return fmt.Errorf("add etcd record failed: %v", err)
+	if err := etcdAdd(cli, &leaseID, service, addr); err != nil {
+		return fmt.Errorf("add service to etcd failed: %v", err)
 	}
-	// 设置服务心跳检测,创建了一个保持租约活动的心跳通道 ch，确保租约在生命周期内保持有效。
-	ch, err := cli.KeepAlive(context.Background(), leaseId)
+	// 设置服务心跳检测，创建了一个保持租约活动的心跳通道 ch，确保租约在生命周期内保持有效。
+	ch, err := cli.KeepAlive(context.Background(), leaseID)
 	if err != nil {
 		return fmt.Errorf("set keepalive failed: %v", err)
 	}
 
-	log.Printf("[%s] register service ok\n", addr)
+	log.Printf("[%s] register service success\n", addr)
+	/*
+		函数同时监听来自 stop 通道的停止信号、cli.Ctx().Done() 的服务关闭信号以及心跳通道 ch 的消息。
+		如果接收到停止信号，函数会返回；
+		如果服务被关闭，函数会打印日志并返回；
+		如果心跳通道被关闭，函数会撤销租约，并返回相应的错误。
+	*/
 	for {
 		select {
 		case err := <-stop:
@@ -63,16 +70,15 @@ func Register(service string, addr string, stop chan error) error {
 			}
 			return err
 		case <-cli.Ctx().Done():
-			log.Println("service closed")
+			log.Println("context done")
 			return nil
 		case _, ok := <-ch:
 			// 监听租约
 			if !ok {
-				log.Println("keep alive channel closed")
-				_, err := cli.Revoke(context.Background(), leaseId)
+				log.Println("keepalive channel closed")
+				_, err := cli.Revoke(context.Background(), leaseID)
 				return err
 			}
-			// log.Printf("Recv reply from service: %s/%s, ttl:%d", service, addr, resp.TTL)
 		}
 	}
 }

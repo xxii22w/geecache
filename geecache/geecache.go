@@ -2,7 +2,7 @@ package geecache
 
 import (
 	"fmt"
-	"geecache/proto"
+	pb "geecache/proto"
 	"geecache/singleflight"
 	"log"
 	"math"
@@ -11,12 +11,17 @@ import (
 	"time"
 )
 
+const (
+	defaultHotCacheRatio      = 8
+	defaultMaxMinuteRemoteQPS = 10
+)
+
 // Group 是缓存命名空间 每个group都有一个名字
 type Group struct {
 	name      string               // 缓存空间的名字
 	getter    Getter               // 数据源获取数据
-	mainCache BaseCache            // 主缓存,用于存储本地节点作为主节点所拥有的数据
-	hotCache  BaseCache            // hotCache 则是为了存储热门数据的缓存
+	mainCache cache            // 主缓存,用于存储本地节点作为主节点所拥有的数据
+	hotCache  cache            // hotCache 则是为了存储热门数据的缓存
 	peers     PeerPicker           // 用于获取远程节点请求客户端
 	loader    *singleflight.Group  // 避免被同一个key多次加载造成缓存击穿
 	keys      map[string]*KeyStats // 根据键key获取对应key的统计信息
@@ -40,7 +45,6 @@ type KeyStats struct { //Key的统计信息
 }
 
 var (
-	maxMinuteRemoteQPS = 10                      //最大QPS
 	mu                 sync.RWMutex              // 读写锁
 	groups             = make(map[string]*Group) // 根据缓存组的名称，获取缓存组
 )
@@ -63,10 +67,10 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 	g := &Group{
 		name:      name,
 		getter:    getter,
-		mainCache: &cache{cacheBytes: cacheBytes, ttl: time.Second * 60},
-		hotCache:  &cache{cacheBytes: cacheBytes / 8, ttl: time.Second * 60},
+		mainCache: cache{cacheBytes: cacheBytes},
+		hotCache:  cache{cacheBytes: cacheBytes / defaultHotCacheRatio},
 		loader:    &singleflight.Group{},
-		keys:   map[string]*KeyStats{},
+		keys:   make(map[string]*KeyStats),
 	}
 	groups[name] = g
 	return g
@@ -121,37 +125,47 @@ func (g *Group) load(key string) (value ByteView, err error) {
 }
 
 func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
-	req := &proto.Request{
+	req := &pb.Request{
 		Group: g.name,
 		Key:   key,
 	}
-	res := &proto.Response{}
+	res := &pb.Response{}
 	err := peer.Get(req, res)
 	if err != nil {
 		return ByteView{}, err
 	}
-	// 远程获取cnt++
+
+	value := ByteView{b: res.Value}
+
+	g.updateKeyStats(key, value)
+
+	return value, nil
+}
+
+func (g *Group) updateKeyStats(key string, value ByteView) {
+	// mu.Lock()
+	// defer mu.Unlock()
+	// 更新键的访问统计信息
 	if stat, ok := g.keys[key]; ok {
 		stat.remoteCnt.Add(1)
-		// 计算qps
 		interval := float64(time.Now().Unix()-stat.firstGetTime.Unix()) / 60
 		qps := stat.remoteCnt.Get() / int64(math.Max(1, math.Round(interval)))
-		if qps >= int64(maxMinuteRemoteQPS) {
-			// 存入hotcache
-			g.populateHotCache(key, ByteView{b: res.Value})
-			// 删除映射关系节省内存
+		// 如果 QPS 超过阈值，将数据添加到热点缓存
+		if qps >= defaultMaxMinuteRemoteQPS {
+			g.populateHotCache(key, value)
 			mu.Lock()
 			delete(g.keys, key)
 			mu.Unlock()
-		} else {
-			g.keys[key] = &KeyStats{
-				firstGetTime: time.Now(),
-				remoteCnt:    1,
-			}
+		}
+	} else {
+		// 首次访问，初始化统计信息
+		g.keys[key] = &KeyStats{
+			firstGetTime: time.Now(),
+			remoteCnt:    1,
 		}
 	}
-	return ByteView{b: res.Value}, nil
 }
+
 
 // getLocally 从数据源获取数据，然后将数据添加到mainCache中
 func (g *Group) getLocally(key string) (ByteView, error) {

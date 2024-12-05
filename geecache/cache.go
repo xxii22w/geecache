@@ -6,11 +6,6 @@ import (
 	"time"
 )
 
-// 基本的缓存操作
-type BaseCache interface {
-	add(key string, value ByteView)
-	get(key string) (value ByteView, ok bool)
-}
 
 type cache struct {
 	mu         sync.Mutex
